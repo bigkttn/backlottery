@@ -317,7 +317,7 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errMsg("user_id missing in path"))
 		return
 	}
-
+	//การแปลงข้อมูลจากสตริงเป็นตัวเลขและตรวจสอบค่าที่รับเข้ามา
 	userID, err := strconv.Atoi(parts[4])
 	if err != nil || userID <= 0 {
 		writeJSON(w, 400, errMsg("invalid user_id"))
@@ -402,7 +402,8 @@ func (s *Server) getLottery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.db.Query("SELECT number, price, status, date, user_id FROM lottery")
+	// เพิ่ม lid ใน SELECT
+	rows, err := s.db.Query("SELECT lid, number, price, status, date, user_id FROM lottery")
 	if err != nil {
 		writeJSON(w, 500, errMsg(err.Error()))
 		return
@@ -410,6 +411,7 @@ func (s *Server) getLottery(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type Lottery struct {
+		LID    int    `json:"lid"` // เพิ่ม field lid
 		Number int    `json:"number"`
 		Price  int    `json:"price"`
 		Status string `json:"status"`
@@ -420,7 +422,7 @@ func (s *Server) getLottery(w http.ResponseWriter, r *http.Request) {
 	lots := []Lottery{}
 	for rows.Next() {
 		var l Lottery
-		if err := rows.Scan(&l.Number, &l.Price, &l.Status, &l.Date, &l.UserID); err != nil {
+		if err := rows.Scan(&l.LID, &l.Number, &l.Price, &l.Status, &l.Date, &l.UserID); err != nil {
 			writeJSON(w, 500, errMsg(err.Error()))
 			return
 		}
