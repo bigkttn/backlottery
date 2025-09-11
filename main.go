@@ -324,25 +324,14 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ดึงข้อมูลจาก body แค่ date
-	var req struct {
-		Date string `json:"date"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, 400, errMsg("bad json"))
-		return
-	}
+	// ใช้วันที่วันนี้เป็น default
+	today := time.Now().Format("2006-01-02")
 
-	if req.Date == "" {
-		writeJSON(w, 400, errMsg("date required"))
-		return
-	}
-
-	price := 80  // ✅ fix price
-	count := 100 // ✅ fix count
+	price := 80  // fix price
+	count := 100 // fix count
 
 	// ดึงเลขทั้งหมดในวันนั้นมาเก็บใน map เพื่อไม่ให้ซ้ำ
-	rows, err := s.db.Query(`SELECT number FROM lottery WHERE date = ?`, req.Date)
+	rows, err := s.db.Query(`SELECT number FROM lottery WHERE date = ?`, today)
 	if err != nil {
 		writeJSON(w, 500, errMsg(err.Error()))
 		return
@@ -373,7 +362,7 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stmt, err := tx.Prepare(`INSERT INTO lottery (number, price, status, date, user_id) VALUES (?, ?, 'ไม่ขาย', ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO lottery (number, price, status, date, user_id) VALUES (?, ?, 'ยังไม่ขาย', ?, ?)`)
 	if err != nil {
 		writeJSON(w, 500, errMsg(err.Error()))
 		return
@@ -383,7 +372,7 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 	inserted := []int{}
 	for i := 0; i < count; i++ {
 		num := randomNumber()
-		_, err := stmt.Exec(num, price, req.Date, userID)
+		_, err := stmt.Exec(num, price, today, userID) // ใช้ today แทน req.Date
 		if err != nil {
 			tx.Rollback()
 			writeJSON(w, 500, errMsg(err.Error()))
@@ -402,6 +391,7 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 		"inserted": inserted,
 		"count":    len(inserted),
 		"price":    price,
+		"date":     today, // ส่งกลับวันที่วันนี้ด้วย
 	})
 }
 
