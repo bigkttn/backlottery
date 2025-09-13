@@ -57,6 +57,8 @@ func main() {
 	mux.HandleFunc("/api/wallet/topup", s.topUpWallet) // เติมเงิน wallet
 	mux.HandleFunc("/api/lottery/generate/", s.generateLotteryPath)
 	mux.HandleFunc("/api/lottery", s.getLottery) // GET lottery
+	mux.HandleFunc("/api/reward/insert", s.insertReward)
+	mux.HandleFunc("/api/reward/get", s.getReward)
 
 	// ✅ เพิ่ม CORS ให้อ่านได้จากมือถือ/Flutter
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -311,40 +313,42 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ตัวอย่าง path: /api/lottery/generate/14
 	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 5 { // ["", "api", "lottery", "generate", "14"]
+	if len(parts) < 5 {
 		writeJSON(w, 400, errMsg("user_id missing in path"))
 		return
 	}
-	//การแปลงข้อมูลจากสตริงเป็นตัวเลขและตรวจสอบค่าที่รับเข้ามา
+
 	userID, err := strconv.Atoi(parts[4])
 	if err != nil || userID <= 0 {
 		writeJSON(w, 400, errMsg("invalid user_id"))
 		return
 	}
 
-	// ใช้วันที่วันนี้เป็น default
 	today := time.Now().Format("2006-01-02")
+	price := 80
+	count := 100
 
-	price := 80  // fix price
-	count := 100 // fix count
-
-	// ดึงเลขทั้งหมดในวันนั้นมาเก็บใน map เพื่อไม่ให้ซ้ำ
-	rows, err := s.db.Query(`SELECT number FROM lottery WHERE date = ?`, today)
+	tx, err := s.db.Begin()
 	if err != nil {
 		writeJSON(w, 500, errMsg(err.Error()))
 		return
 	}
-	defer rows.Close()
+	_, err = tx.Exec(`DELETE FROM reward`)
+	if err != nil {
+		tx.Rollback()
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	// ลบล็อตเตอรี่ทั้งหมดก่อน (ทุกวัน ทุก user)
+	_, err = tx.Exec(`DELETE FROM lottery`)
+	if err != nil {
+		tx.Rollback()
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
 
 	existing := map[int]bool{}
-	for rows.Next() {
-		var n int
-		if err := rows.Scan(&n); err == nil {
-			existing[n] = true
-		}
-	}
 
 	randomNumber := func() int {
 		for {
@@ -356,14 +360,9 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		writeJSON(w, 500, errMsg(err.Error()))
-		return
-	}
-
 	stmt, err := tx.Prepare(`INSERT INTO lottery (number, price, status, date, user_id) VALUES (?, ?, 'ยังไม่ขาย', ?, ?)`)
 	if err != nil {
+		tx.Rollback()
 		writeJSON(w, 500, errMsg(err.Error()))
 		return
 	}
@@ -372,7 +371,7 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 	inserted := []int{}
 	for i := 0; i < count; i++ {
 		num := randomNumber()
-		_, err := stmt.Exec(num, price, today, userID) // ใช้ today แทน req.Date
+		_, err := stmt.Exec(num, price, today, userID)
 		if err != nil {
 			tx.Rollback()
 			writeJSON(w, 500, errMsg(err.Error()))
@@ -391,7 +390,7 @@ func (s *Server) generateLotteryPath(w http.ResponseWriter, r *http.Request) {
 		"inserted": inserted,
 		"count":    len(inserted),
 		"price":    price,
-		"date":     today, // ส่งกลับวันที่วันนี้ด้วย
+		"date":     today,
 	})
 }
 
@@ -427,6 +426,197 @@ func (s *Server) getLottery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lots = append(lots, l)
+	}
+
+	writeJSON(w, 200, lots)
+}
+
+// ====================== insert reward =========================
+
+func (s *Server) insertReward(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+
+	today := time.Now().Format("2006-01-02")
+	tx, err := s.db.Begin()
+	if err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	// ลบรางวัลเก่าทั้งหมด
+	_, err = tx.Exec(`DELETE FROM reward`)
+
+	// ดึงเลขล็อตเตอรี่วันนี้
+	rows, err := s.db.Query("SELECT lid, number FROM lottery WHERE date=?", today)
+	if err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	defer rows.Close()
+
+	type Lotto struct {
+		LID    int
+		Number string
+	}
+
+	var all []Lotto
+	for rows.Next() {
+		var l Lotto
+		rows.Scan(&l.LID, &l.Number)
+		all = append(all, l)
+	}
+	if len(all) == 0 {
+		writeJSON(w, 400, errMsg("no lottery for today"))
+		return
+	}
+
+	rand.Seed(time.Now().UnixNano())
+
+	// tx, err := s.db.Begin()
+	// if err != nil {
+	// 	writeJSON(w, 500, errMsg(err.Error()))
+	// 	return
+
+	// }
+
+	stmt, err := tx.Prepare(`INSERT INTO reward (type, money, lottery_id) VALUES (?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	defer stmt.Close()
+
+	results := []map[string]any{}
+
+	// รางวัลที่ 1,2,3 : เลือก 1 ตัว
+	topPrizes := []struct {
+		Type  string
+		Money int
+	}{
+		{"รางวัลที่ 1", 6000000},
+		{"รางวัลที่ 2", 200000},
+		{"รางวัลที่ 3", 80000},
+	}
+	for _, p := range topPrizes {
+		l := all[rand.Intn(len(all))]
+		_, err := stmt.Exec(p.Type, p.Money, l.LID)
+		if err != nil {
+			tx.Rollback()
+			writeJSON(w, 500, errMsg(err.Error()))
+			return
+		}
+		results = append(results, map[string]any{
+			"type":       p.Type,
+			"money":      p.Money,
+			"lottery_id": l.LID,
+		})
+	}
+
+	// เลขท้าย 2 ตัว: สุ่มเลขท้ายจากล็อตเตอรี่จริง
+	twoDigitCandidates := []Lotto{}
+	for _, l := range all {
+		if len(l.Number) >= 2 {
+			twoDigitCandidates = append(twoDigitCandidates, l)
+		}
+	}
+
+	if len(twoDigitCandidates) > 0 {
+		chosen := twoDigitCandidates[rand.Intn(len(twoDigitCandidates))]
+		suffix2 := chosen.Number[len(chosen.Number)-2:]
+
+		for _, l := range all {
+			if len(l.Number) >= 2 && l.Number[len(l.Number)-2:] == suffix2 {
+				_, err := stmt.Exec("เลขท้าย 2 ตัว", 2000, l.LID)
+				if err != nil {
+					tx.Rollback()
+					writeJSON(w, 500, errMsg(err.Error()))
+					return
+				}
+				results = append(results, map[string]any{
+					"type":       "เลขท้าย 2 ตัว",
+					"money":      2000,
+					"lottery_id": l.LID,
+				})
+			}
+		}
+	}
+
+	// เลขท้าย 3 ตัว: สุ่มเลขท้ายจากล็อตเตอรี่จริง
+	threeDigitCandidates := []Lotto{}
+	for _, l := range all {
+		if len(l.Number) >= 3 {
+			threeDigitCandidates = append(threeDigitCandidates, l)
+		}
+	}
+
+	if len(threeDigitCandidates) > 0 {
+		chosen := threeDigitCandidates[rand.Intn(len(threeDigitCandidates))]
+		suffix3 := chosen.Number[len(chosen.Number)-3:]
+
+		for _, l := range all {
+			if len(l.Number) >= 3 && l.Number[len(l.Number)-3:] == suffix3 {
+				_, err := stmt.Exec("เลขท้าย 3 ตัว", 4000, l.LID)
+				if err != nil {
+					tx.Rollback()
+					writeJSON(w, 500, errMsg(err.Error()))
+					return
+				}
+				results = append(results, map[string]any{
+					"type":       "เลขท้าย 3 ตัว",
+					"money":      4000,
+					"lottery_id": l.LID,
+				})
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	writeJSON(w, 201, results)
+}
+
+// ====================== get reward =========================
+
+func (s *Server) getReward(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Join reward กับ lottery เพื่อเอาเลขล็อตเตอรี่
+	rows, err := s.db.Query(`
+		SELECT r.rid, r.money, r.type, r.lottery_id, l.number
+		FROM reward r
+		JOIN lottery l ON r.lottery_id = l.lid
+	`)
+	if err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	defer rows.Close()
+
+	type Reward struct {
+		Rid       int    `json:"rid"`
+		Money     int    `json:"money"`
+		Type      string `json:"type"`
+		LotteryID int    `json:"lottery_id"`
+		Number    string `json:"number"`
+	}
+
+	lots := []Reward{}
+	for rows.Next() {
+		var r Reward
+		if err := rows.Scan(&r.Rid, &r.Money, &r.Type, &r.LotteryID, &r.Number); err != nil {
+			writeJSON(w, 500, errMsg(err.Error()))
+			return
+		}
+		lots = append(lots, r)
 	}
 
 	writeJSON(w, 200, lots)
