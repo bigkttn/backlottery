@@ -59,6 +59,7 @@ func main() {
 	mux.HandleFunc("/api/lottery", s.getLottery) // GET lottery
 	mux.HandleFunc("/api/reward/insert", s.insertReward)
 	mux.HandleFunc("/api/reward/get", s.getReward)
+	mux.HandleFunc("/api/buy", s.buyLottery)
 
 	// ✅ เพิ่ม CORS ให้อ่านได้จากมือถือ/Flutter
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -620,4 +621,116 @@ func (s *Server) getReward(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, lots)
+}
+
+// ====================== Buy Lottery =========================
+func (s *Server) buyLottery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+
+	// อ่าน body
+	var req struct {
+		UserID    int `json:"userId"`
+		LotteryID int `json:"lotteryId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, errMsg("bad json"))
+		return
+	}
+
+	// เริ่ม transaction
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Println("Error starting transaction:", err)
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	defer tx.Rollback()
+
+	// ดึงข้อมูลสลาก
+	var price int
+	var status string
+	var date string
+	err = tx.QueryRow(`
+		SELECT price, status, date 
+		FROM lottery 
+		WHERE lid=? FOR UPDATE`,
+		req.LotteryID).Scan(&price, &status, &date)
+	if err == sql.ErrNoRows {
+		log.Println("Lottery not found with lid:", req.LotteryID)
+		writeJSON(w, 404, errMsg("ไม่พบสลากนี้"))
+		return
+	}
+	if err != nil {
+		log.Println("Error querying lottery:", err)
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	log.Printf("Successfully retrieved lottery %d. Status: %s, Price: %d", req.LotteryID, status, price)
+
+	// ตรวจสอบว่าสลากยังไม่ขาย
+	if status != "ยังไม่ขาย" {
+		writeJSON(w, 400, errMsg("สลากนี้ขายแล้ว"))
+		return
+	}
+
+	// ดึงยอดเงินผู้ใช้
+	var money int
+	err = tx.QueryRow("SELECT money FROM user WHERE uid=? FOR UPDATE", req.UserID).Scan(&money)
+	if err != nil {
+		log.Println("Error querying user money:", err)
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	log.Printf("Successfully retrieved user %d. Current money: %d", req.UserID, money)
+
+	if money < price {
+		writeJSON(w, 400, errMsg("เงินไม่พอซื้อสลาก"))
+		return
+	}
+
+	// insert ลง buylottery (ใช้ DATETIME สำหรับ date)
+	_, err = tx.Exec(`
+    INSERT INTO buylottery (status_buy, date, lottery_id, user_id)
+    VALUES (?, ?, ?, ?)`,
+		"ยังไม่ตรวจ", time.Now().Format("2006-01-02 15:04:05"), req.LotteryID, req.UserID)
+	if err != nil {
+		// This log is crucial for debugging your problem
+		log.Println("Error inserting into buylottery:", err)
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	log.Println("Successfully inserted into buylottery table.")
+
+	// update lottery status
+	_, err = tx.Exec("UPDATE lottery SET status='ขายแล้ว' WHERE lid=?", req.LotteryID)
+	if err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	// หักเงินผู้ใช้
+	_, err = tx.Exec("UPDATE user SET money = money - ? WHERE uid=?", price, req.UserID)
+	if err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	// commit transaction
+	if err := tx.Commit(); err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	// ส่ง response
+	writeJSON(w, 200, map[string]any{
+		"message":   "ซื้อสลากสำเร็จ",
+		"userId":    req.UserID,
+		"lotteryId": req.LotteryID,
+		"price":     price,
+		"statusBuy": "ยังตรวจ",
+		"date":      date,
+	})
 }
