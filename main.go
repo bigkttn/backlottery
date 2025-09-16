@@ -60,6 +60,8 @@ func main() {
 	mux.HandleFunc("/api/reward/insert", s.insertReward)
 	mux.HandleFunc("/api/reward/get", s.getReward)
 	mux.HandleFunc("/api/buy", s.buyLottery)
+	mux.HandleFunc("/api/Delete", s.DeSytem)
+	mux.HandleFunc("/api/my-lotteries", s.myLotteries)
 
 	// ✅ เพิ่ม CORS ให้อ่านได้จากมือถือ/Flutter
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -206,6 +208,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, errMsg("invalid phone or password"))
 		return
 	}
+
 	if err != nil {
 		writeJSON(w, 500, errMsg(err.Error()))
 		return
@@ -440,17 +443,13 @@ func (s *Server) insertReward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	today := time.Now().Format("2006-01-02")
 	tx, err := s.db.Begin()
-	if err != nil {
-		writeJSON(w, 500, errMsg(err.Error()))
-		return
-	}
+
 	// ลบรางวัลเก่าทั้งหมด
 	_, err = tx.Exec(`DELETE FROM reward`)
 
 	// ดึงเลขล็อตเตอรี่วันนี้
-	rows, err := s.db.Query("SELECT lid, number FROM lottery WHERE date=?", today)
+	rows, err := s.db.Query("SELECT lid, number FROM lottery")
 	if err != nil {
 		writeJSON(w, 500, errMsg(err.Error()))
 		return
@@ -469,7 +468,7 @@ func (s *Server) insertReward(w http.ResponseWriter, r *http.Request) {
 		all = append(all, l)
 	}
 	if len(all) == 0 {
-		writeJSON(w, 400, errMsg("no lottery for today"))
+		writeJSON(w, 400, errMsg("no lottery"))
 		return
 	}
 
@@ -732,5 +731,115 @@ func (s *Server) buyLottery(w http.ResponseWriter, r *http.Request) {
 		"price":     price,
 		"statusBuy": "ยังตรวจ",
 		"date":      date,
+	})
+}
+func (s *Server) DeSytem(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
+		}
+	}()
+	// ลบตารางต่าง ๆ
+	if _, err = tx.Exec(`DELETE FROM reward`); err != nil {
+		tx.Rollback()
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	if _, err = tx.Exec(`DELETE FROM lottery`); err != nil {
+		tx.Rollback()
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	if _, err = tx.Exec(`DELETE FROM user WHERE role = ?`, "MEMBER"); err != nil {
+		tx.Rollback()
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	// commit transaction
+	if err := tx.Commit(); err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"message": "ล้างข้อมูลระบบเรียบร้อยแล้ว",
+	})
+}
+
+// ====================== MY LOTTERIES (GET) =========================
+// GET /api/my-lotteries?uid=12
+// คืนลิสต์ล็อตเตอรี่ที่ user ซื้อแล้ว จากตาราง buylottery + lottery
+func (s *Server) myLotteries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	uidStr := strings.TrimSpace(r.URL.Query().Get("uid"))
+	if uidStr == "" {
+		writeJSON(w, 400, errMsg("uid required"))
+		return
+	}
+	uid, err := strconv.Atoi(uidStr)
+	if err != nil || uid <= 0 {
+		writeJSON(w, 400, errMsg("bad uid"))
+		return
+	}
+
+	const q = `
+SELECT 
+  bl.bid,           -- ไอดีรายการซื้อ (ถ้ามีคอลัมน์ชื่ออื่น ปรับให้ตรง)
+  l.lid,            -- ไอดีลอตเตอรี่
+  l.number,         -- เลข 6 หลัก
+  l.price,          -- ราคา ณ ตอนขาย
+  bl.date           -- วันที่ซื้อ
+FROM buylottery bl
+JOIN lottery   l ON l.lid = bl.lottery_id
+WHERE bl.user_id = ?
+ORDER BY bl.date DESC, bl.bid DESC
+`
+	rows, err := s.db.Query(q, uid)
+	if err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+	defer rows.Close()
+
+	type item struct {
+		Bid    int64     `json:"bid"`
+		Lid    int64     `json:"lid"`
+		Number string    `json:"number"`
+		Price  int       `json:"price"`
+		Date   time.Time `json:"date"`
+	}
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.Bid, &it.Lid, &it.Number, &it.Price, &it.Date); err != nil {
+			writeJSON(w, 500, errMsg(err.Error()))
+			return
+		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, 500, errMsg(err.Error()))
+		return
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"uid":   uid,
+		"count": len(items),
+		"items": items,
 	})
 }
